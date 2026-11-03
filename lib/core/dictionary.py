@@ -16,213 +16,354 @@
 #
 #  Author: Mauro Soria
 
-import re
+from __future__ import annotations
 import threading
+from collections import Counter
+from dataclasses import dataclass
+from typing import Iterator
 
-from lib.utils.fmt import safequote, uniq, lowercase, uppercase, capitalize
-from lib.utils.file import File, FileUtils
+from lib.core.settings import SCRIPT_PATH
+from lib.core.wordlist_backend import (
+    NativeWordlistChunk,
+    NativeWordlistCorpus,
+    get_wordlist_backend,
+    is_valid_path,
+)
+from lib.core.wordlist_config import WordlistConfig
+from lib.utils.file import FileUtils
 
 
-class Dictionary(object):
+@dataclass
+class _NativeClaim:
+    chunk: NativeWordlistChunk
+    start: int
+    released: int = 0
 
+
+# Get ignore paths for status codes.
+# Reference: https://github.com/maurosoria/dirsearch#Blacklist
+def get_blacklists(config: WordlistConfig) -> dict[int, Dictionary]:
+    blacklists = {}
+
+    for status in [400, 403, 500]:
+        blacklist_file_name = FileUtils.build_path(SCRIPT_PATH, "db")
+        blacklist_file_name = FileUtils.build_path(
+            blacklist_file_name, f"{status}_blacklist.txt"
+        )
+
+        if not FileUtils.can_read(blacklist_file_name):
+            # Skip if cannot read file
+            continue
+
+        blacklists[status] = Dictionary(
+            config,
+            files=[blacklist_file_name],
+            is_blacklist=True,
+        )
+
+    return blacklists
+
+
+class Dictionary:
     def __init__(
         self,
-        paths,
-        extensions,
-        suffixes=None,
-        prefixes=None,
-        lowercase=False,
-        uppercase=False,
-        capitalization=False,
-        force_extensions=False,
-        exclude_extensions=[],
-        no_extension=False,
-        only_selected=False,
-    ):
-
-        self.entries = []
-        self.current_index = 0
-        self.condition = threading.Lock()
-        self._extensions = extensions
-        self._exclude_extensions = exclude_extensions
-        self._prefixes = prefixes
-        self._suffixes = suffixes
-        self._paths = paths
-        self._force_extensions = force_extensions
-        self._no_extension = no_extension
-        self._only_selected = only_selected
-        self.lowercase = lowercase
-        self.uppercase = uppercase
-        self.capitalization = capitalization
-        self.dictionary_files = [File(path) for path in self.paths]
-        self.generate()
+        config: WordlistConfig,
+        *,
+        files: list[str] | None = None,
+        is_blacklist: bool = False,
+    ) -> None:
+        self.config = config
+        self._lock = threading.Lock()
+        self._index = 0
+        # Restored dictionaries use saved items, not the original input files
+        # or generator. This also avoids initializing an unused native backend.
+        self._items = [] if files is None else self.generate(files, is_blacklist)
+        self._item_membership: set[str] | None = None
+        # Items in self._extra will be cleared when self.reset() is called
+        self._extra_index = 0
+        self._extra = []
+        self._extra_membership: set[str] = set()
+        self._claimed = []
+        self._native_claim: _NativeClaim | None = None
 
     @property
-    def extensions(self):
-        return self._extensions
+    def index(self) -> int:
+        with self._lock:
+            return self._index
 
-    @extensions.setter
-    def extensions(self, value):
-        self._extensions = value
-
-    @property
-    def paths(self):
-        return self._paths
-
-    @paths.setter
-    def paths(self, paths):
-        self._paths = paths
-
-    """
-    Dictionary.generate() behaviour
-
-    Classic dirsearch wordlist:
-      1. If %EXT% keyword is present, append one with each extension REPLACED.
-      2. If the special word is no present, append line unmodified.
-
-    Forced extensions wordlist (NEW):
-      This type of wordlist processing is a mix between classic processing
-      and DirBuster processing.
-          1. If %EXT% keyword is present in the line, immediately process as "classic dirsearch" (1).
-          2. If the line does not include the special word AND is NOT terminated by a slash,
-            append one with each extension APPENDED (line.ext) and ONLYE ONE with a slash.
-          3. If the line does not include the special word and IS ALREADY terminated by slash,
-            append line unmodified.
-    """
-
-    def generate(self):
-        reext = re.compile(r"\%ext\%", re.IGNORECASE).sub
-        result = []
-
-        # Enable to use multiple dictionaries at once
-        for dict_file in self.dictionary_files:
-            for line in uniq(dict_file.get_lines(), filt=True):
-                # Skip comments
-                if line.startswith("#"):
-                    continue
-
-                if line.startswith("/"):
-                    line = line[1:]
-
-                if self._no_extension:
-                    line = line[0] + line[1:].split(".")[0]
-                    # Skip dummy paths
-                    if line == ".":
-                        continue
-
-                # Skip if the path contains excluded extensions
-                if self._exclude_extensions and (
-                    any(["." + extension in line for extension in self._exclude_extensions])
-                ):
-                    continue
-
-                # Classic dirsearch wordlist processing (with %EXT% keyword)
-                if "%ext%" in line.lower():
-                    for extension in self._extensions:
-                        newline = reext(extension, line)
-                        result.append(newline)
-
-                # If forced extensions is used and the path is not a directory ... (terminated by /)
-                # process line like a forced extension.
-                elif self._force_extensions and not line.rstrip().endswith("/") and "." not in line:
-                    for extension in self._extensions:
-                        result.append(line + "." + extension)
-
-                    result.append(line)
-                    result.append(line + "/")
-
-                # Append line unmodified.
-                else:
-                    if not self._only_selected or any(
-                        [line.endswith("." + extension) for extension in self.extensions]
-                    ):
-                        result.append(line)
-
-        # Some custom changes
-        for entry in uniq(result):
-            entries = [entry]
-            for pref in self._prefixes:
-                if not entry.startswith(pref):
-                    entries.append(pref + entry)
-            for suff in self._suffixes:
-                if not entry.endswith("/") and not entry.endswith(suff):
-                    entries.append(entry + suff)
-
-            if self.lowercase:
-                self.entries.extend(lowercase(entries))
-            elif self.uppercase:
-                self.entries.extend(uppercase(entries))
-            elif self.capitalization:
-                self.entries.extend(capitalize(entries))
+    def __next__(self) -> str:
+        with self._lock:
+            if len(self._extra) > self._extra_index:
+                self._extra_index += 1
+                return self._extra[self._extra_index - 1]
+            elif len(self._items) > self._index:
+                self._index += 1
+                return self._items[self._index - 1]
             else:
-                self.entries.extend(entries)
+                raise StopIteration
 
-        del result
+    def claim_next(self) -> str:
+        """Return the next path and keep it recoverable until released."""
+        with self._lock:
+            if len(self._extra) > self._extra_index:
+                path = self._extra[self._extra_index]
+                self._claimed.append(path)
+                self._extra_index += 1
+                return path
+            elif len(self._items) > self._index:
+                path = self._items[self._index]
+                self._claimed.append(path)
+                self._index += 1
+                return path
+            else:
+                raise StopIteration
 
-    # Get ignore paths for status codes.
-    # More information: https://github.com/maurosoria/dirsearch#Blacklist
-    @staticmethod
-    def generate_blacklists(extensions, script_path):
-        reext = re.compile(r"\%ext\%", re.IGNORECASE).sub
-        blacklists = {}
+    def claim_many(self, maximum: int) -> list[str]:
+        """Claim up to maximum paths atomically, preserving queue order."""
+        if maximum <= 0:
+            return []
 
-        for status in [400, 403, 500]:
-            blacklist_file_name = FileUtils.build_path(script_path, "db")
-            blacklist_file_name = FileUtils.build_path(
-                blacklist_file_name, "{}_blacklist.txt".format(status)
+        with self._lock:
+            extra_count = min(maximum, len(self._extra) - self._extra_index)
+            if extra_count:
+                extra_end = self._extra_index + extra_count
+                paths = self._extra[self._extra_index:extra_end]
+                self._extra_index = extra_end
+            else:
+                paths = []
+
+            item_count = min(
+                maximum - len(paths),
+                len(self._items) - self._index,
             )
-
-            if not FileUtils.can_read(blacklist_file_name):
-                # Skip if cannot read file
-                continue
-
-            blacklists[status] = []
-
-            for line in FileUtils.get_lines(blacklist_file_name):
-                # Skip comments
-                if line.lstrip().startswith("#"):
-                    continue
-
-                if line.startswith("/"):
-                    line = line[1:]
-
-                # Classic dirsearch blacklist processing (with %EXT% keyword)
-                if "%ext%" in line.lower():
-                    for extension in extensions:
-                        entry = reext.sub(extension, line)
-                        blacklists[status].append(entry)
-
-                # Forced extensions is not used here because -r is only used for wordlist,
-                # applying in blacklist may create false negatives
-
+            if item_count:
+                item_end = self._index + item_count
+                items = self._items[self._index:item_end]
+                if paths:
+                    paths.extend(items)
                 else:
-                    blacklists[status].append(line)
+                    paths = items
+                self._index = item_end
 
-        return blacklists
+            self._claimed.extend(paths)
+            return paths
 
-    def next_with_index(self, base_path=None):
-        self.condition.acquire()
+    def claim_native_many(
+        self,
+        maximum: int,
+        base_path: str,
+    ) -> list[str] | NativeWordlistChunk:
+        """Claim a Rust-owned range without materializing its Python strings."""
+        if maximum <= 0:
+            return []
 
-        try:
-            result = self.entries[self.current_index]
+        with self._lock:
+            if self._native_claim is not None:
+                raise RuntimeError("native dictionary claim is still active")
 
-        except IndexError:
-            self.condition.release()
-            raise StopIteration
+            if not isinstance(self._items, NativeWordlistCorpus):
+                extra_count = min(maximum, len(self._extra) - self._extra_index)
+                if extra_count:
+                    extra_end = self._extra_index + extra_count
+                    paths = self._extra[self._extra_index:extra_end]
+                    self._extra_index = extra_end
+                else:
+                    paths = []
 
-        self.current_index = self.current_index + 1
-        current_index = self.current_index
-        self.condition.release()
-        return current_index, result
+                item_count = min(
+                    maximum - len(paths),
+                    len(self._items) - self._index,
+                )
+                if item_count:
+                    item_end = self._index + item_count
+                    items = self._items[self._index:item_end]
+                    if paths:
+                        paths.extend(items)
+                    else:
+                        paths = items
+                    self._index = item_end
+                self._claimed.extend(paths)
+                return paths
 
-    def __next__(self, base_path=None):
-        _, path = self.next_with_index(base_path)
-        return safequote(path)
+            # Dynamic discoveries retain priority and stay on the established
+            # Python claim path. The next iteration resumes the native corpus.
+            extra_count = min(maximum, len(self._extra) - self._extra_index)
+            if extra_count:
+                extra_end = self._extra_index + extra_count
+                paths = self._extra[self._extra_index:extra_end]
+                self._extra_index = extra_end
+                self._claimed.extend(paths)
+                return paths
 
-    def reset(self):
-        self.condition.acquire()
-        self.current_index = 0
-        self.condition.release()
+            item_count = min(maximum, len(self._items) - self._index)
+            if not item_count:
+                return []
+            start = self._index
+            chunk = self._items.chunk(start, item_count, base_path)
+            self._index += item_count
+            self._native_claim = _NativeClaim(chunk, start)
+            return chunk
 
-    def __len__(self):
-        return len(self.entries)
+    def release_native_claims(
+        self,
+        chunk: NativeWordlistChunk,
+        count: int,
+    ) -> None:
+        """Release an ordered prefix from the active Rust-owned claim."""
+        if count <= 0:
+            return
+
+        with self._lock:
+            claim = self._native_claim
+            if claim is None or claim.chunk is not chunk:
+                raise ValueError("native wordlist chunk is not claimed")
+            if claim.released + count > len(chunk):
+                raise ValueError("native wordlist release exceeds claimed chunk")
+            claim.released += count
+            if claim.released == len(chunk):
+                self._native_claim = None
+
+    def release_claim(self, path: str) -> None:
+        with self._lock:
+            self._claimed.remove(path)
+
+    def release_claims(self, paths: list[str]) -> None:
+        """Release several completed claims in one bounded lock operation."""
+        if not paths:
+            return
+
+        with self._lock:
+            count = len(paths)
+            # Native chunks normally complete in claim order. Removing the
+            # prefix avoids a separate linear search for every path.
+            if count == len(self._claimed) and self._claimed == paths:
+                self._claimed.clear()
+                return
+            if self._claimed[:count] == paths:
+                del self._claimed[:count]
+                return
+
+            # Pause/cancellation can leave an out-of-order subset. Preserve
+            # unmatched claims so session recovery can requeue them.
+            pending = Counter(paths)
+            claimed = []
+            for path in self._claimed:
+                if pending[path]:
+                    pending[path] -= 1
+                else:
+                    claimed.append(path)
+
+            if any(pending.values()):
+                raise ValueError("list.remove(x): x not in list")
+            self._claimed = claimed
+
+    def requeue_claims(self) -> None:
+        """Make outstanding claims available again in their original order."""
+        with self._lock:
+            if not self._claimed and self._native_claim is None:
+                return
+
+            if self._claimed:
+                self._extra[self._extra_index:self._extra_index] = self._claimed
+                self._claimed.clear()
+            if self._native_claim is not None:
+                claim = self._native_claim
+                # NativeFuzzer has one synchronous chunk in flight, so no later
+                # corpus claim can exist when cancellation rewinds this range.
+                self._index = claim.start + claim.released
+                self._native_claim = None
+
+    def __contains__(self, item: str) -> bool:
+        return item in self._items
+
+    def __getstate__(self) -> tuple[list[str], int, list[str], int]:
+        with self._lock:
+            extra = (
+                self._extra[:self._extra_index]
+                + self._claimed
+                + self._extra[self._extra_index:]
+            )
+            index = self._index
+            if self._native_claim is not None:
+                index = self._native_claim.start + self._native_claim.released
+            items = (
+                self._items.to_list()
+                if isinstance(self._items, NativeWordlistCorpus)
+                else list(self._items)
+            )
+            return items, index, extra, self._extra_index
+
+    def __setstate__(self, state: tuple[list[str], int, list[str], int]) -> None:
+        """Restore queue state on a dictionary initialized with explicit policy."""
+        with self._lock:
+            self._items, self._index, self._extra, self._extra_index = state
+            self._item_membership = None
+            self._extra_membership = set(self._extra)
+            self._claimed = []
+            self._native_claim = None
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def generate(
+        self,
+        files: list[str],
+        is_blacklist: bool = False,
+    ) -> list[str] | NativeWordlistCorpus:
+        """
+        Dictionary.generate() behaviour
+
+        Classic dirsearch wordlist:
+          1. If %EXT% keyword is present, append one with each extension REPLACED.
+          2. If the special word is no present, append line unmodified.
+
+        Forced extensions wordlist (NEW):
+          This type of wordlist processing is a mix between classic processing
+          and DirBuster processing.
+              1. If %EXT% keyword is present in the line, immediately process as "classic dirsearch" (1).
+              2. If the line does not include the special word AND is NOT terminated by a slash,
+                append one with each extension APPENDED (line.ext) and ONLY ONE with a slash.
+              3. If the line does not include the special word and IS ALREADY terminated by slash,
+                append line unmodified.
+        """
+
+        return get_wordlist_backend(self.config).generate(
+            files, is_blacklist=is_blacklist
+        )
+
+    def is_valid(self, path: str) -> bool:
+        return is_valid_path(path, self.config)
+
+    def add_extra(self, path: str) -> None:
+        """Queue a valid dynamically discovered path once."""
+        if not self.is_valid(path):
+            return
+
+        with self._lock:
+            if (
+                self._item_membership is None
+                and not isinstance(self._items, NativeWordlistCorpus)
+            ):
+                self._item_membership = set(self._items)
+
+            in_items = (
+                path in self._items
+                if isinstance(self._items, NativeWordlistCorpus)
+                else path in self._item_membership
+            )
+            if in_items or path in self._extra_membership:
+                return
+
+            self._extra.append(path)
+            self._extra_membership.add(path)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._index = self._extra_index = 0
+            self._extra.clear()
+            self._extra_membership.clear()
+            self._claimed.clear()
+            self._native_claim = None

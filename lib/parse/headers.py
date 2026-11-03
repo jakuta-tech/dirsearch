@@ -16,46 +16,45 @@
 #
 #  Author: Mauro Soria
 
-import email
+from __future__ import annotations
 
-from io import StringIO
+from email.parser import BytesParser
 
-from lib.utils.fmt import lowercase
+from lib.core.settings import NEW_LINE
+from lib.core.structures import CaseInsensitiveDict
 
 
-class HeadersParser(object):
-    def __init__(self, headers):
-        self.headers = {}
-        self.raw = None
+class HeadersParser:
+    def __init__(self, headers: str | dict[str, str]) -> None:
+        self.str = self.dict = headers
 
         if isinstance(headers, str):
-            self.headers = self.raw_to_headers(headers)
-            self.raw = headers
-        elif isinstance(headers, (dict, list)):
-            self.raw = self.headers_to_raw(headers)
-            self.headers = self.raw_to_headers(self.raw)
+            self.dict = self.str_to_dict(headers)
+        elif isinstance(headers, dict):
+            self.str = self.dict_to_str(headers)
+            self.dict = self.str_to_dict(self.str)
 
-        self.lower_headers = lowercase(self.headers)
+        self.headers = CaseInsensitiveDict(self.dict)
+
+    def get(self, key: str) -> str:
+        return self.headers[key]
 
     @staticmethod
-    def raw_to_headers(raw):
-        if not raw:
+    def str_to_dict(headers: str) -> dict[str, str]:
+        if not headers:
             return {}
 
-        return dict(
-            email.message_from_file(StringIO(raw))
-        )
+        return dict(BytesParser().parsebytes(headers.encode()))
 
     @staticmethod
-    def headers_to_raw(headers):
+    def dict_to_str(headers: dict[str, str]) -> str:
         if not headers:
             return
 
-        if isinstance(headers, dict):
-            return "\r\n".join(
-                "{0}: {1}".format(key, value) for key, value in headers.items()
-            )
-        elif isinstance(headers, list):
-            return "\r\n".join(headers)
-        else:
-            return
+        return NEW_LINE.join(f"{key}: {value}" for key, value in headers.items())
+
+    def __iter__(self):
+        return iter(self.headers.items())
+
+    def __str__(self) -> str:
+        return self.str
